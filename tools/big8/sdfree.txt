@@ -1,0 +1,1 @@
+arc,pin_name,_nf_index,inst_names,nf_names,ce_arc,ce_irf,ce_orf,ce_td,ce_ts,ce_from,ce_to,ce_lib,ce_grp,net_index,ap,pin_cap,ck_slew,pin_net,pin_inst,pin_slot,pin_ct,pin_slack_net,const,clk_of,clk_inv,lev,nf_pin_net,nf_pid,ap_cnt,ap_pin,ap_pid,ne_drv,ne_snk,ck_rows,g_start,g_to,g_orf,chk,net_drv,nf_net,inst_ct,inst_loc

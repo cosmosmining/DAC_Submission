@@ -1,0 +1,1 @@
+{"ovf_stage": 1.76, "crit_round": 0.036, "pw_batch": 2.3, "power_round": 2.3, "reshape": 0.043, "rs_pass": 2.41, "post_crit": 0.034, "ovf_round": 1.729, "dl_chunk": 1.1, "dgr_write": 0.23, "dgr_test": 0.35, "dgr_build": 0.35, "dgr_fp": 1.5, "dgr_desc": 0.42}

@@ -1,0 +1,211 @@
+"""promote_full.py: the promotion round as ONE C++ call (tools/fast3x/promote_full.cc).
+
+  promote_cpp(S, r, max_nets, tw_scale, fl, w)                        == tools/c1hfast/promote_cpp.py::promote_cpp
+  promote_pw(S, r, max_nets, tw_scale, fl, w, pwn=None, order=None)   == tools/tilefix/promote_pw.py::promote_cpp
+Both return (undo, stats) and leave S.new, S._dirty, S.la.d, la.tw / la.pn / la.c_load / la.r_drv exactly as the Python loops do.
+Python only packs inputs into flat arrays (static per-design tables are cached on S) and unpacks the changed nets afterwards.
+FLUTE: the same libflute_bridge instance as fl (fl.lib.flute_tree, already initialised) is called from C++.
+"""
+import ctypes, gc, math, os, sys, time
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+_lib = ctypes.CDLL(os.path.join(HERE, "libpromote_full." + ("dylib" if sys.platform == "darwin" else "so")))
+_P = ctypes.c_void_p
+_lib.pf_round.argtypes = [_P, _P, _P]; _lib.pf_round.restype = ctypes.c_long
+_lib.pf_nchanged.restype = ctypes.c_long; _lib.pf_nsegs.restype = ctypes.c_long
+_lib.pf_fetch.argtypes = [_P] * 5; _lib.pf_fetch.restype = None
+_lib.pf_times.argtypes = [_P]; _lib.pf_times.restype = None
+THREADS = int(os.environ.get("PF_THREADS", os.environ.get("OMP_NUM_THREADS", "8")))
+_TAGS = ("not_in_route", "kept", "topo_base", "topo_rsmt")
+_CST = np.array([math.exp(0.5) - 1.0, math.exp(0.25) - 1.0, math.exp(1.5)])
+
+
+def _key(name):
+    from timing_promote import _key as k
+    return k(name)
+
+
+def _static(S):
+    """per-design tables (pins, access points, DEF net -> .net index) and per-attach tables (DEF net -> route index)."""
+    st = getattr(S, "_pf_static", None)
+    SD, la = S.SD, S.la
+    if st is None:
+        D = S.D
+        keys = list(SD.net_names)                                          # promote looks nets up by SD.net_names[n] as is
+        tk = S.tidx_key
+        st = {"keys": keys,
+              "net_j": np.array([tk.get(k, -1) for k in keys], np.int64),
+              "pin_start": np.ascontiguousarray(S.pin_start, np.int64), "pin_end": np.ascontiguousarray(S.pin_end, np.int64),
+              "ap_start": np.ascontiguousarray(S.ap_start, np.int64), "ap_cnt": np.ascontiguousarray(D.ap_cnt, np.int64),
+              "ap": np.ascontiguousarray(np.asarray(D.ap, np.int32).reshape(-1, 3)),
+              "ridx": None, "packed": {}, "undo_pk": {}}
+        S._pf_static = st
+    if st["ridx"] is not S.ridx:                                            # attach() makes a new dict
+        rx = S.ridx
+        st["net_i"] = np.array([rx.get(k, -1) for k in st["keys"]], np.int64)
+        st["ridx"] = rx
+        st["packed"] = {}; st["undo_pk"] = {}
+    if st.get("la") is not la or st.get("dirs_src") is not la.dirs:
+        assert la.d.dtype == np.float64 and la.c.dtype == np.float64
+        st["la"] = la; st["dirs_src"] = la.dirs
+        st["dirs"] = np.ascontiguousarray(la.dirs, dtype=np.int32)
+        st["u"] = np.ascontiguousarray(la.u, dtype=np.float64)
+        st["R"] = np.ascontiguousarray(la.R, dtype=np.float64); st["C"] = np.ascontiguousarray(la.C, dtype=np.float64)
+        st["Rv"] = np.ascontiguousarray(la.Rv, dtype=np.float64)
+    return st
+
+
+def _base(S, st):
+    seg = S.segs
+    arr, off = getattr(seg, "arr", None), getattr(seg, "off", None)
+    if arr is None:                                                         # list-of-lists route (fastmode3.State3)
+        c = st.get("base_list")
+        if c is None or c[0] is not seg:
+            cnt = np.array([len(s) for s in seg], np.int64)
+            flat = [x for s in seg for x in s]
+            a = np.array(flat, np.int64).reshape(-1, 6) if flat else np.zeros((0, 6), np.int64)
+            o = np.zeros(len(seg) + 1, np.int64); o[1:] = np.cumsum(cnt)
+            st["base_list"] = c = (seg, a, o)
+        return c[1], c[2]
+    c = st.get("base_arr")
+    if c is None or c[0] is not arr or c[1] is not off:
+        st["base_arr"] = c = (arr, off, np.ascontiguousarray(arr, np.int64), np.ascontiguousarray(off, np.int64))
+    return c[2], c[3]
+
+
+_EMPTY = np.zeros((1, 6), np.int64)
+
+
+def _pack_new(S, st, nroute):
+    """address and length of every current S.new segment list as an int64 [k,6] block (cached per list object)."""
+    pk = st["packed"]
+    ptr = np.zeros(nroute, np.int64); cnt = np.full(nroute, -1, np.int64)
+    new = S.new
+    if new:
+        ps, cs = [], []
+        for i, lst in new.items():
+            c = pk.get(i)
+            if c is None or c[0] is not lst:
+                c = st["undo_pk"].get(i)                                    # S.revert() put an undo list back
+            if c is None or c[0] is not lst:
+                a = np.ascontiguousarray(np.array(lst, np.int64).reshape(-1, 6)) if lst else _EMPTY
+                pk[i] = c = (lst, a, a.ctypes.data, len(lst))
+            ps.append(c[2]); cs.append(c[3])
+        ks = np.fromiter(new.keys(), np.int64, len(new))
+        ptr[ks] = ps; cnt[ks] = cs
+    return ptr, cnt
+
+
+def _unpack(S, st, nc, nsg, changed, off, segs, undo, new):
+    """undo (first change wins, values == S.new[i] or S.segs[i]), S.new[i] = new tuple lists, S._dirty."""
+    if not nc:
+        return
+    ch = changed[:nc].tolist(); of = off.tolist()
+    tup = list(map(tuple, segs[:nsg].tolist()))
+    pk = st["packed"]
+    upk = st["undo_pk"] = {}
+    base_need = []
+    for i in ch:
+        if i not in undo:
+            if i in new:
+                undo[i] = new[i]
+                c = pk.get(i)
+                if c is not None and c[0] is new[i]:
+                    upk[i] = c
+            else:
+                undo[i] = None; base_need.append(i)
+    if base_need:                                                       # == S.segs[i], built in one pass
+        src = S.segs; sarr = getattr(src, "arr", None)
+        if sarr is not None and getattr(src, "off", None) is not None:
+            so = np.asarray(src.off, np.int64)
+            bi = np.array(base_need, np.int64); o0 = so[bi]; c = so[bi + 1] - o0
+            cs = np.cumsum(c)
+            idx = np.repeat(o0 - (cs - c), c) + np.arange(int(cs[-1]) if len(cs) else 0)
+            rows = list(map(tuple, sarr[idx].tolist()))
+            cc = [0] + cs.tolist()
+            for k_, i in enumerate(base_need):
+                undo[i] = rows[cc[k_]:cc[k_ + 1]]
+        else:
+            for i in base_need:
+                undo[i] = src[i]
+    addr = segs.ctypes.data
+    for t, i in enumerate(ch):
+        a0, a1 = of[t], of[t + 1]
+        lst = tup[a0:a1]
+        new[i] = lst
+        pk[i] = (lst, segs, addr + 48 * a0, a1 - a0)
+    S._dirty.update(S.tid[changed[:nc]].tolist())
+
+
+TIMES = []                                                                  # per call: (prep, C++ call, unpack) seconds
+
+
+def _run(S, r, order, tw_scale, fl, w, pwn, pw_mode):
+    t0 = time.perf_counter()
+    la = S.la
+    if len(order) == 0:                                                     # the Python loop does nothing (no tables needed)
+        TIMES.append((time.perf_counter() - t0, 0.0, 0.0) + (0.0,) * 8)
+        return {}, {}
+    st = _static(S)
+    barr, boff = _base(S, st)
+    nroute = len(boff) - 1
+    nptr, ncnt = _pack_new(S, st, nroute)
+    order = np.ascontiguousarray(order, np.int64)
+    cl = np.ascontiguousarray(np.clip(0.5 * r["net_ctot"], 1.0, 1e5), np.float64)
+    rd = np.ascontiguousarray(r["net_rd_kohm"], np.float64)
+    w64 = np.ascontiguousarray(w, np.float64)
+    pw64 = np.ascontiguousarray(pwn, np.float64) if pwn is not None else None
+    sd = np.array(la.d.strides, np.int64) // 8; sc = np.array(la.c.strides, np.int64) // 8
+    fptr = ctypes.cast(fl.lib.flute_tree, ctypes.c_void_p).value if fl is not None else 0
+    arrs = [la.d, la.c, st["u"], st["R"], st["C"], st["Rv"], _CST, st["dirs"], sd, sc, order, w64, cl, rd, pw64,
+            st["net_i"], st["net_j"], st["pin_start"], st["pin_end"], st["ap_start"], st["ap_cnt"], st["ap"],
+            barr, boff, nptr, ncnt, None]
+    P = (ctypes.c_void_p * 28)(*[(a.ctypes.data if a is not None else 0) for a in arrs], fptr)
+    I = np.array([la.L, la.X, la.Y, len(order), 1 if pw_mode else 0, nroute, THREADS], np.int64)
+    F = np.array([la.w4, la.um, tw_scale], np.float64)
+    t1 = time.perf_counter()
+    rc = _lib.pf_round(P, I.ctypes.data, F.ctypes.data)
+    t2 = time.perf_counter()
+    if rc not in (0, -1):
+        raise RuntimeError(f"pf_round failed rc={rc}")
+    nc, nsg = _lib.pf_nchanged(), _lib.pf_nsegs()
+    changed = np.zeros(max(nc, 1), np.int64); off = np.zeros(nc + 1, np.int64); segs = np.zeros((max(nsg, 1), 6), np.int64)
+    stv = np.zeros(8, np.int64); last = np.zeros(1, np.int64)
+    _lib.pf_fetch(changed.ctypes.data, off.ctypes.data, segs.ctypes.data, stv.ctypes.data, last.ctypes.data)
+    # ---- unpack: undo (first change wins), S.new, S._dirty, stats ----
+    undo = {}
+    new = S.new
+    gc_on = gc.isenabled(); gc.disable()                                    # no cyclic-GC pause while building the tuples
+    try:
+        _unpack(S, st, nc, nsg, changed, off, segs, undo, new)
+    finally:
+        if gc_on: gc.enable()
+    pos = sorted((int(stv[2 * c + 1]), c) for c in range(4) if stv[2 * c] > 0)
+    stats = {_TAGS[c]: int(stv[2 * c]) for _, c in pos}
+    n_last = int(last[0])
+    if n_last >= 0:
+        la.c_load, la.r_drv = float(cl[n_last]), float(rd[n_last])
+    if rc == -1:                                                            # the Python loop raises here, earlier nets committed
+        raise ValueError("min() arg is an empty sequence (pin without access points)")
+    ct = np.zeros(8); _lib.pf_times(ct.ctypes.data)
+    TIMES.append((t1 - t0, t2 - t1, time.perf_counter() - t2, *ct.tolist()))
+    return undo, stats
+
+
+def promote_cpp(S, r, max_nets, tw_scale, fl, w):
+    cand = np.nonzero(w > 0)[0]
+    order = cand[np.argsort(-w[cand], kind="stable")][:max_nets]
+    out = _run(S, r, order, tw_scale, fl, w, None, False)
+    S.la.tw = 0.0
+    return out
+
+
+def promote_pw(S, r, max_nets, tw_scale, fl, w, pwn=None, order=None):
+    if order is None:
+        cand = np.nonzero(w > 0)[0]
+        order = cand[np.argsort(-w[cand], kind="stable")][:max_nets]
+    S.la.pn = 0.0
+    out = _run(S, r, order, tw_scale, fl, w, pwn, True)
+    S.la.tw = 0.0; S.la.pn = 0.0
+    return out

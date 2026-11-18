@@ -1,0 +1,805 @@
+// csta_inc_kern.cc: INCREMENTAL exact C++ timer (plan item T3 / E1).
+// The whole original kernel (tools/gapla/csta_kern.cc + csta_rc.inc) is compiled into this library by inclusion, so every
+// original entry point (csta_set, csta_analyze, csta_build_rc, csta_crit, ...) is unchanged and the per-arc / per-edge
+// arithmetic of the update is literally the same source (dmp_gate1, dmp_load1, lut). New entry points (csta_inc_*):
+//   csta_inc_bind(info)         reverse indices of the bound design + safety checks (unique writer per pin/rf, level order)
+//   csta_inc_full(bwd, stats)   full analysis into PERSISTENT state (AT, SL, gate_d, wire_d, BEST, net_rd, rmin, ep_sl,
+//                               driver-model records per (pin, rf), picked-arc rd per gate group, S_reqk/S_valid);
+//                               bwd = 0 skips the required-time pass (RAT / pin slack / net slack not written)
+//   csta_inc_begin()            start a transaction (applies required-time rows kept visible by the last reject)
+//   csta_inc_set_rc(...)        copy the RC of some nets from given arrays into the bound rc_* arrays (logged)
+//   csta_inc_build_rc_subset()  rebuild the RC of some nets from their segments into the bound rc_* arrays (logged)
+//   csta_inc_update(nets)       re-time the fan-out cone of the changed nets (dirty lists per level, stop where the
+//                               values are bit-identical to the stored ones); bit-identical to csta_inc_full
+//   csta_inc_commit() / csta_inc_reject()   drop / undo the transaction. reject keeps S_reqk/S_valid of the rejected
+//                               state visible to csta_crit until the next begin (= what the chain sees today: K.crit reads
+//                               the required times of the LAST analyze), then restores them.
+// Calling the ORIGINAL csta_analyze in this library overwrites S_reqk: call csta_inc_full again afterwards.
+// Build (host): tools/engine/build_inc.sh  (g++ -std=c++17 -O3 -ffp-contract=off -fno-fast-math -shared -fPIC).
+#include "../gapla/csta_kern.cc"
+
+static inline bool beq(double a, double b) { uint64_t x, y; memcpy(&x, &a, 8); memcpy(&y, &b, 8); return x == y; }
+static inline bool dp_eq(const DP& a, const DP& b) {
+  return beq(a.slew, b.slew) && beq(a.t0, b.t0) && beq(a.dt, b.dt) && beq(a.k0, b.k0) && beq(a.k1, b.k1) && beq(a.k2, b.k2) &&
+         beq(a.k3, b.k3) && beq(a.k4, b.k4) && beq(a.p1, b.p1) && beq(a.p2, b.p2) && beq(a.vub, b.vub) && beq(a.vod, b.vod) &&
+         beq(a.vth, b.vth) && beq(a.vl, b.vl) && beq(a.vh, b.vh) && beq(a.der, b.der) && a.alg == b.alg && a.valid == b.valid;
+}
+static inline DP dp_init() { DP d; memset(&d, 0, sizeof(DP)); d.alg = -1; return d; }
+
+// ---------------------------------------------------------------- persistent state
+static i64 I_P = 0, I_K = 0, I_nE = 0, I_nn = 0, I_nlev = 0, I_nrow = 0, I_g0 = 0, I_g1 = 0, I_e0 = 0, I_e1 = 0;
+static std::vector<double> I_AT, I_SL, I_gd, I_as, I_wd, I_nrd, I_rmin, I_ep, I_grd, I_RAT, I_psl, I_nsl;   // I_as: arc output slew
+static std::vector<i64> I_BEST, I_gpke;
+static std::vector<unsigned char> I_gpk;
+static std::vector<DP> I_dps;
+static bool I_ready = false, I_full = false;
+// indices
+static std::vector<i64> I_glv, I_gs1, I_elv;                       // group level, group arc end, net-edge level
+static std::vector<i64> netg_o, netg, nete_o, nete, drve_o, drve, rdg_o, rdg, rda_o, rda, prow_o, prow, apin_o, apin, I_agrp;
+// dirty lists
+static std::vector<std::vector<i64>> Gd, Ed;
+static std::vector<unsigned char> gflag, eflag, rflag, pflag, nflag, rdflag, aflag;
+static std::vector<i64> rlist, plist, nlist, rdlist;
+static i64 cur_phase = 0, late_marks = 0;                          // phase = 2*lv (groups) or 2*lv+1 (edges)
+// undo logs
+struct LD { double* p; double v; }; struct LI { i64* p; i64 v; }; struct LU { unsigned char* p; unsigned char v; };
+struct LP { DP* p; DP v; };
+static std::vector<LD> lD, lDq, pDq; static std::vector<LI> lI; static std::vector<LU> lU, lUq, pUq; static std::vector<LP> lP;
+static inline bool wD(double* p, double v) { if (beq(*p, v)) return false; lD.push_back({p, *p}); *p = v; return true; }
+static inline bool wI(i64* p, i64 v) { if (*p == v) return false; lI.push_back({p, *p}); *p = v; return true; }
+static inline bool wU(unsigned char* p, unsigned char v) { if (*p == v) return false; lU.push_back({p, *p}); *p = v; return true; }
+static inline bool wP(DP* p, const DP& v) { if (dp_eq(*p, v)) return false; lP.push_back({p, *p}); *p = v; return true; }
+
+// ---------------------------------------------------------------- design arrays (fetched once per call)
+struct DA {
+  i64 P, K, nlev, nE, nn, def_lib, nsp, nrow, nevt;
+  const i64 *ce_from, *ce_to, *ce_irf, *ce_orf, *ce_lib, *ce_td, *ce_ts, *ce_lo, *g_lo, *g_start, *g_to, *g_orf, *ne_lo, *ne_drv,
+      *ne_snk, *pin_net, *sp_pin, *sp_cls, *sp_rf, *ck_pin, *ck_tr, *ck_tf, *ck_type, *ck_evt;
+  const double *L_vth, *L_vl, *L_vh, *L_der, *L_vin, *ck_slew, *sp_at, *ck_cks, *ck_off, *REL;
+  const unsigned char *is_port, *reg_ck;
+  double *c1, *c2, *rpi, *ctot, *elm; unsigned char* par;
+};
+static DA da() {
+  DA d;
+  TB.A = g<double>("tabA"); TB.B = g<double>("tabB"); TB.V = g<double>("tabV");
+  TB.NA = g<i64>("tabNA"); TB.NB = g<i64>("tabNB"); TB.M = gi("tabM"); TB.T = gi("tabT");
+  d.P = gi("P"); d.K = gi("K"); d.nlev = gi("nlev"); d.nE = gi("nE"); d.nn = gi("nn"); d.def_lib = gi("def_lib"); d.nsp = gi("nsp");
+  d.nrow = gi("nrow"); d.nevt = gi("nevt");
+  d.ce_from = g<i64>("ce_from"); d.ce_to = g<i64>("ce_to"); d.ce_irf = g<i64>("ce_irf"); d.ce_orf = g<i64>("ce_orf");
+  d.ce_lib = g<i64>("ce_lib"); d.ce_td = g<i64>("ce_td"); d.ce_ts = g<i64>("ce_ts"); d.ce_lo = g<i64>("ce_lo");
+  d.g_lo = g<i64>("g_lo"); d.g_start = g<i64>("g_start"); d.g_to = g<i64>("g_to"); d.g_orf = g<i64>("g_orf");
+  d.ne_lo = g<i64>("ne_lo"); d.ne_drv = g<i64>("ne_drv"); d.ne_snk = g<i64>("ne_snk"); d.pin_net = g<i64>("pin_net");
+  d.sp_pin = g<i64>("sp_pin"); d.sp_cls = g<i64>("sp_cls"); d.sp_rf = g<i64>("sp_rf");
+  d.ck_pin = g<i64>("ck_pin"); d.ck_tr = g<i64>("ck_tr"); d.ck_tf = g<i64>("ck_tf"); d.ck_type = g<i64>("ck_type"); d.ck_evt = g<i64>("ck_evt");
+  d.L_vth = g<double>("L_vth"); d.L_vl = g<double>("L_vl"); d.L_vh = g<double>("L_vh"); d.L_der = g<double>("L_der");
+  d.L_vin = g<double>("L_vin"); d.ck_slew = g<double>("ck_slew"); d.sp_at = g<double>("sp_at");
+  d.ck_cks = g<double>("ck_cks"); d.ck_off = g<double>("ck_off"); d.REL = g<double>("REL");
+  d.is_port = g<unsigned char>("is_port"); d.reg_ck = g<unsigned char>("reg_ck");
+  d.c1 = (double*)g<double>("rc_c1"); d.c2 = (double*)g<double>("rc_c2"); d.rpi = (double*)g<double>("rc_rpi");
+  d.ctot = (double*)g<double>("rc_ctot"); d.elm = (double*)g<double>("rc_elm"); d.par = (unsigned char*)g<unsigned char>("rc_par");
+  return d;
+}
+
+// ---------------------------------------------------------------- one gate group (same code as csta_analyze lines 469-511)
+struct GOut { double sl; DP dp; unsigned char pk; i64 pke; double rd; i64 pick_recomputed; };
+static inline void arc_compute(const DA& d, i64 e, Dmp& r) {
+  i64 frm = d.ce_from[e], to = d.ce_to[e], irf = d.ce_irf[e], orf = d.ce_orf[e], li = d.ce_lib[e];
+  i64 net = d.pin_net[to];
+  Arc A;
+  A.td = d.ce_td[e]; A.ts = d.ce_ts[e]; A.sin = I_SL[frm * 2 + irf];
+  A.c2 = d.c2[net * 2 + orf]; A.rpi = d.rpi[net * 2 + orf]; A.c1 = d.c1[net * 2 + orf];
+  A.vth = d.L_vth[li * 2 + orf]; A.vl = d.L_vl[li * 2 + orf]; A.vh = d.L_vh[li * 2 + orf]; A.der = d.L_der[li];
+  dmp_gate1(A, d.par[net] != 0, d.ctot[net * 2 + orf], r);
+}
+static const int STORED = -9;   // res[].alg marker: arc not re-solved, slew / delay taken from the stored I_as / I_gd
+// all = true: every arc re-solved (full pass; RC of the output net changed). all = false: only the arcs flagged in aflag
+// (their input slew changed); the others are exactly the stored results of the same inputs (dmp_gate1 is deterministic).
+static void group_compute(const DA& d, i64 gg, bool all, Dmp* res, double* at_o, i64* best_o, GOut& o) {
+  const i64 lv = I_glv[gg], s0 = d.g_start[gg], s1 = I_gs1[gg], b = d.ce_lo[lv + 1], K = d.K;
+  for (i64 e = s0; e < s1; e++) {
+    if (all || aflag[e]) arc_compute(d, e, res[e - s0]);
+    else { res[e - s0].slew = I_as[e]; res[e - s0].delay = I_gd[e]; res[e - s0].alg = STORED; }
+  }
+  double smax = res[0].slew;
+  for (i64 e = s0 + 1; e < s1; e++) smax = mx(smax, res[e - s0].slew);
+  o.sl = smax; o.pick_recomputed = 0;
+  i64 pk = -1;
+  for (i64 e = s0; e < s1; e++) if (res[e - s0].slew >= smax) { pk = e; break; }
+  if (pk < 0) pk = b;
+  o.pke = pk; o.pk = pk < b; o.rd = 0.0;
+  if (pk < b && res[pk - s0].alg == STORED && I_gpk[gg] && I_gpke[gg] == pk) {   // same picked arc, same inputs: same record
+    o.dp = I_dps[d.g_to[gg] * 2 + d.g_orf[gg]]; o.rd = I_grd[gg];
+  } else if (pk < b) {
+    if (res[pk - s0].alg == STORED) { arc_compute(d, pk, res[pk - s0]); o.pick_recomputed = 1; }
+    const Dmp& r = res[pk - s0];
+    DP& dd = o.dp; memset(&dd, 0, sizeof(DP));
+    dd.slew = r.slew; dd.t0 = r.t0; dd.dt = r.dt; dd.k0 = r.k0; dd.k1 = r.k1; dd.k2 = r.k2; dd.k3 = r.k3; dd.k4 = r.k4;
+    dd.p1 = r.p1; dd.p2 = r.p2; dd.vub = r.vub; dd.vod = r.vod; dd.vth = r.vth; dd.vl = r.vl; dd.vh = r.vh; dd.der = r.der;
+    dd.alg = r.alg; dd.valid = r.valid;
+    o.rd = r.rd;
+  } else o.dp = dp_init();
+  for (i64 k = 0; k < K; k++) {
+    double amax = NEG; bool first = true;
+    for (i64 e = s0; e < s1; e++) {
+      double c = I_AT[(d.ce_from[e] * K + k) * 2 + d.ce_irf[e]] + res[e - s0].delay;
+      amax = first ? c : mx(amax, c); first = false;
+    }
+    at_o[k] = amax;
+    i64 best = d.nE;
+    for (i64 e = s0; e < s1; e++) {
+      double c = I_AT[(d.ce_from[e] * K + k) * 2 + d.ce_irf[e]] + res[e - s0].delay;
+      if (c >= amax - 1e-12) { best = e; break; }
+    }
+    best_o[k] = best;
+  }
+}
+// ---------------------------------------------------------------- one net edge, one transition (csta_analyze lines 521-533)
+static void edge_compute(const DA& d, i64 i, i64 rf, double* wd_o, double* ls_o, double* at_o) {
+  i64 drv = d.ne_drv[i], snk = d.ne_snk[i];
+  double elm = d.elm[snk * 2 + rf], wd, ls;
+  dmp_load1(I_dps[drv * 2 + rf], elm, &wd, &ls);
+  if (d.is_port[drv]) {
+    bool okp = std::isfinite(elm);
+    double vin = d.L_vin[d.def_lib * 2 + rf], vlo = d.L_vl[d.def_lib * 2 + rf], vhi = d.L_vh[d.def_lib * 2 + rf];
+    wd = okp ? -elm * std::log(1.0 - vin) : 0.0;
+    ls = I_SL[drv * 2 + rf] + (okp ? elm * std::log((1 - vlo) / (1 - vhi)) / d.L_der[d.def_lib] : 0.0);
+  }
+  *wd_o = wd; *ls_o = ls;
+  for (i64 k = 0; k < d.K; k++) at_o[k] = I_AT[(drv * d.K + k) * 2 + rf] + wd;
+}
+// ---------------------------------------------------------------- one endpoint row (csta_analyze lines 547-568)
+static double row_compute(const DA& d, i64 r, double* reqk_o, unsigned char* valid_o) {
+  const i64 K = d.K;
+  i64 p = d.ck_pin[r];
+  double setup[2];
+  for (int rf = 0; rf < 2; rf++) {
+    i64 tid = rf == 0 ? d.ck_tr[r] : d.ck_tf[r];
+    setup[rf] = 0.0;
+    if (tid >= 0) setup[rf] = lut(tid, d.ck_cks[r], I_SL[p * 2 + rf]);
+    else if (d.ck_type[r] <= 1) setup[rf] = NaN;
+  }
+  double rmin = BIG;
+  for (i64 k = 0; k < K; k++) {
+    double req = d.REL[k * d.nevt + d.ck_evt[r]];
+    for (int rf = 0; rf < 2; rf++) {
+      double rk = req - setup[rf] - d.ck_off[r];
+      double at = I_AT[(p * K + k) * 2 + rf];
+      bool v = (at > NEG / 2) && (req < BIG / 2) && std::isfinite(rk);
+      reqk_o[k * 2 + rf] = rk;
+      valid_o[k * 2 + rf] = v;
+      double sl = v ? rk - at : BIG;
+      rmin = mn(rmin, sl);
+    }
+  }
+  return rmin;
+}
+
+static void csr(i64 n, const std::vector<std::pair<i64, i64>>& kv, std::vector<i64>& off, std::vector<i64>& val) {
+  off.assign(n + 1, 0);
+  for (auto& q : kv) off[q.first + 1]++;
+  for (i64 i = 0; i < n; i++) off[i + 1] += off[i];
+  val.resize(kv.size());
+  std::vector<i64> f(off.begin(), off.end() - 1);
+  for (auto& q : kv) val[f[q.first]++] = q.second;   // kv given in increasing value order -> lists sorted
+}
+
+// info[0..15]: P K nlev nE nn nrow nG nNE orphan_arcs to_mismatch neg_net multi_writer order_viol nsp_overwritten 0 0
+extern "C" int csta_inc_bind(i64* info) {
+  DA d = da();
+  I_P = d.P; I_K = d.K; I_nE = d.nE; I_nn = d.nn; I_nlev = d.nlev; I_nrow = d.nrow;
+  I_g0 = d.g_lo[1]; I_g1 = d.g_lo[d.nlev]; I_e0 = d.ne_lo[1]; I_e1 = d.ne_lo[d.nlev];
+  const i64 nG = I_g1, nNE = I_e1;
+  i64 orphan = 0, tomis = 0, negnet = 0, multi = 0, viol = 0, spov = 0;
+  I_glv.assign(nG, 0); I_gs1.assign(nG, 0); I_elv.assign(nNE, 0);
+  for (i64 lv = 1; lv < d.nlev; lv++) {
+    i64 a = d.ce_lo[lv], b = d.ce_lo[lv + 1], ga = d.g_lo[lv], gb = d.g_lo[lv + 1];
+    orphan += (gb > ga) ? (d.g_start[ga] - a) : (b - a);
+    for (i64 gg = ga; gg < gb; gg++) {
+      I_glv[gg] = lv; I_gs1[gg] = (gg + 1 < gb) ? d.g_start[gg + 1] : b;
+      if (I_gs1[gg] <= d.g_start[gg]) tomis++;                       // empty group (python would fail)
+      for (i64 e = d.g_start[gg]; e < I_gs1[gg]; e++) if (d.ce_to[e] != d.g_to[gg] || d.ce_orf[e] != d.g_orf[gg]) tomis++;
+      if (d.pin_net[d.g_to[gg]] < 0) negnet++;
+    }
+    for (i64 i = d.ne_lo[lv]; i < d.ne_lo[lv + 1]; i++) { I_elv[i] = lv; if (d.pin_net[d.ne_snk[i]] < 0) negnet++; }
+  }
+  // writers of (pin, rf): step 2*lv (group) or 2*lv+1 (net edge)
+  std::vector<i64> ws((size_t)d.P * 2, -1);
+  for (i64 gg = I_g0; gg < nG; gg++) { i64 key = d.g_to[gg] * 2 + d.g_orf[gg]; if (ws[key] >= 0) multi++; ws[key] = 2 * I_glv[gg]; }
+  for (i64 i = I_e0; i < nNE; i++) for (int rf = 0; rf < 2; rf++) {
+    i64 key = d.ne_snk[i] * 2 + rf; if (ws[key] >= 0) multi++; ws[key] = 2 * I_elv[i] + 1; }
+  for (i64 i = 0; i < d.nsp; i++) if (ws[d.sp_pin[i] * 2 + d.sp_rf[i]] >= 0) spov++;    // fine (writer overwrites), reported
+  for (i64 gg = I_g0; gg < nG; gg++)
+    for (i64 e = d.g_start[gg]; e < I_gs1[gg]; e++) { i64 w = ws[d.ce_from[e] * 2 + d.ce_irf[e]]; if (w >= 2 * I_glv[gg]) viol++; }
+  for (i64 i = I_e0; i < nNE; i++) for (int rf = 0; rf < 2; rf++) { i64 w = ws[d.ne_drv[i] * 2 + rf]; if (w >= 2 * I_elv[i] + 1) viol++; }
+  // reverse indices
+  std::vector<std::pair<i64, i64>> kv;
+  kv.clear(); for (i64 gg = I_g0; gg < nG; gg++) { i64 n = d.pin_net[d.g_to[gg]]; if (n >= 0) kv.push_back({n, gg}); }
+  csr(d.nn, kv, netg_o, netg);
+  kv.clear(); for (i64 i = I_e0; i < nNE; i++) { i64 n = d.pin_net[d.ne_snk[i]]; if (n >= 0) kv.push_back({n, i}); }
+  csr(d.nn, kv, nete_o, nete);
+  kv.clear(); for (i64 i = I_e0; i < nNE; i++) kv.push_back({d.ne_drv[i], i});
+  csr(d.P, kv, drve_o, drve);
+  kv.clear();
+  { std::vector<i64> last((size_t)d.P * 2, -1);
+    for (i64 gg = I_g0; gg < nG; gg++)
+      for (i64 e = d.g_start[gg]; e < I_gs1[gg]; e++) { i64 key = d.ce_from[e] * 2 + d.ce_irf[e]; if (last[key] != gg) { last[key] = gg; kv.push_back({key, gg}); } } }
+  csr(d.P * 2, kv, rdg_o, rdg);
+  kv.clear(); I_agrp.assign(d.nE, -1);
+  for (i64 gg = I_g0; gg < nG; gg++) for (i64 e = d.g_start[gg]; e < I_gs1[gg]; e++) I_agrp[e] = gg;
+  for (i64 e = 0; e < d.nE; e++) if (I_agrp[e] >= 0) kv.push_back({d.ce_from[e] * 2 + d.ce_irf[e], e});
+  csr(d.P * 2, kv, rda_o, rda);
+  kv.clear(); for (i64 r = 0; r < d.nrow; r++) kv.push_back({d.ck_pin[r], r});
+  csr(d.P, kv, prow_o, prow);
+  // AP pins per net (the pins whose Elmore value build_rc of that net can write)
+  { const i64 *ap_off = g<i64>("ap_off"), *ap_idx = g<i64>("ap_idx"), *ap_pid = g<i64>("ap_pid");
+    apin_o.assign(d.nn + 1, 0); apin.clear();
+    for (i64 n = 0; n < d.nn; n++) { for (i64 t = ap_off[n]; t < ap_off[n + 1]; t++) apin.push_back(ap_pid[ap_idx[t]]); apin_o[n + 1] = (i64)apin.size(); } }
+  // state
+  I_AT.assign((size_t)d.P * d.K * 2, NEG); I_BEST.assign((size_t)d.P * d.K * 2, -1);
+  I_SL.assign((size_t)d.P * 2, 0.0); I_wd.assign((size_t)d.P * 2, 0.0); I_gd.assign(d.nE, 0.0); I_as.assign(d.nE, 0.0); I_nrd.assign(d.nn, 0.0);
+  I_rmin.assign(d.nrow, 0.0); I_ep.assign(d.P, BIG); I_grd.assign(nG, 0.0); I_gpk.assign(nG, 0); I_gpke.assign(nG, 0);
+  I_dps.assign((size_t)d.P * 2, dp_init());
+  I_RAT.assign((size_t)d.P * d.K * 2, BIG); I_psl.assign(d.P, BIG); I_nsl.assign(d.nn, BIG);
+  Gd.assign(d.nlev + 1, {}); Ed.assign(d.nlev + 1, {});
+  gflag.assign(nG, 0); eflag.assign((size_t)nNE * 2, 0); rflag.assign(d.nrow, 0); pflag.assign(d.P, 0); nflag.assign(d.nn, 0);
+  rdflag.assign(d.nn, 0); aflag.assign(d.nE, 0);
+  lD.clear(); lDq.clear(); pDq.clear(); lI.clear(); lU.clear(); lUq.clear(); pUq.clear(); lP.clear();
+  I_ready = (orphan == 0 && tomis == 0 && negnet == 0 && multi == 0 && viol == 0);
+  I_full = false;
+  i64 v[16] = {d.P, d.K, d.nlev, d.nE, d.nn, d.nrow, nG - I_g0, nNE - I_e0, orphan, tomis, negnet, multi, viol, spov, 0, 0};
+  for (int i = 0; i < 16; i++) info[i] = v[i];
+  return I_ready ? 0 : 1;
+}
+
+// ---------------------------------------------------------------- full analysis into the persistent state
+// stats: [0] forward [1] endpoints [2] backward [3] total
+extern "C" int csta_inc_full(int backward, double* stats) {
+  double tA = now();
+  DA d = da();
+  const i64 P = d.P, K = d.K, nE = d.nE, nn = d.nn;
+  for (i64 i = 0; i < P * K * 2; i++) { I_AT[i] = NEG; I_BEST[i] = -1; }
+  for (i64 i = 0; i < P * 2; i++) { I_SL[i] = 0.0; I_wd[i] = 0.0; }
+  for (i64 i = 0; i < nE; i++) { I_gd[i] = 0.0; I_as[i] = 0.0; }
+  for (i64 i = 0; i < nn; i++) I_nrd[i] = 0.0;
+  for (i64 i = 0; i < d.nsp; i++) I_AT[(d.sp_pin[i] * K + d.sp_cls[i]) * 2 + d.sp_rf[i]] = d.sp_at[i];
+  for (i64 p = 0; p < P; p++) if (d.reg_ck[p]) { I_SL[p * 2] = d.ck_slew[p * 2]; I_SL[p * 2 + 1] = d.ck_slew[p * 2 + 1]; }
+  const DP z = dp_init();
+  for (auto& q : I_dps) q = z;
+  for (i64 gg = 0; gg < (i64)I_gpk.size(); gg++) { I_gpk[gg] = 0; I_grd[gg] = 0.0; I_gpke[gg] = 0; }
+  for (i64 lv = 1; lv < d.nlev; lv++) {
+    i64 ga = d.g_lo[lv], gb = d.g_lo[lv + 1];
+    if (gb > ga) {
+      pfor(gb - ga, 64, [&](i64 lo_, i64 hi_) {
+        thread_local std::vector<Dmp> res; thread_local std::vector<double> at; thread_local std::vector<i64> bs;
+        at.resize(K); bs.resize(K);
+        for (i64 gg = ga + lo_; gg < ga + hi_; gg++) {
+          i64 s0 = d.g_start[gg], s1 = I_gs1[gg];
+          if ((i64)res.size() < s1 - s0) res.resize(s1 - s0);
+          GOut o; group_compute(d, gg, true, res.data(), at.data(), bs.data(), o);
+          for (i64 e = s0; e < s1; e++) { I_gd[e] = res[e - s0].delay; I_as[e] = res[e - s0].slew; }
+          i64 gto = d.g_to[gg], gorf = d.g_orf[gg];
+          I_SL[gto * 2 + gorf] = o.sl;
+          if (o.pk) I_dps[gto * 2 + gorf] = o.dp;
+          for (i64 k = 0; k < K; k++) { I_AT[(gto * K + k) * 2 + gorf] = at[k]; I_BEST[(gto * K + k) * 2 + gorf] = bs[k]; }
+          I_gpk[gg] = o.pk; I_grd[gg] = o.rd; I_gpke[gg] = o.pke;
+        }
+      });
+      for (i64 gg = ga; gg < gb; gg++) if (I_gpk[gg]) { i64 net = d.pin_net[d.ce_to[I_gpke[gg]]]; I_nrd[net] = mx(I_nrd[net], I_grd[gg]); }
+    }
+    i64 a = d.ne_lo[lv], b = d.ne_lo[lv + 1];
+    if (b > a) {
+      i64 nb = b - a;
+      pfor(2 * nb, 128, [&](i64 lo_, i64 hi_) {
+        thread_local std::vector<double> at; at.resize(K);
+        for (i64 j = lo_; j < hi_; j++) {
+          i64 rf = j / nb, i = a + (j % nb), snk = d.ne_snk[i];
+          double wd, ls; edge_compute(d, i, rf, &wd, &ls, at.data());
+          I_wd[snk * 2 + rf] = wd; I_SL[snk * 2 + rf] = ls;
+          for (i64 k = 0; k < K; k++) I_AT[(snk * K + k) * 2 + rf] = at[k];
+        }
+      });
+    }
+  }
+  double tB = now();
+  S_reqk.assign((size_t)d.nrow * K * 2, 0.0); S_valid.assign((size_t)d.nrow * K * 2, 0);
+  pfor(d.nrow, 4096, [&](i64 lo_, i64 hi_) { for (i64 r = lo_; r < hi_; r++)
+    I_rmin[r] = row_compute(d, r, S_reqk.data() + r * K * 2, S_valid.data() + r * K * 2); });
+  for (i64 p = 0; p < P; p++) I_ep[p] = BIG;
+  for (i64 r = 0; r < d.nrow; r++) I_ep[d.ck_pin[r]] = mn(I_ep[d.ck_pin[r]], I_rmin[r]);
+  double tC = now();
+  if (backward) {   // same code as csta_analyze lines 574-611
+    const i64 *ce_lo = d.ce_lo, *ne_lo = d.ne_lo;
+    for (i64 i = 0; i < P * K * 2; i++) I_RAT[i] = BIG;
+    for (i64 r = 0; r < d.nrow; r++)
+      for (i64 k = 0; k < K; k++)
+        for (int rf = 0; rf < 2; rf++) {
+          i64 ix = (d.ck_pin[r] * K + k) * 2 + rf;
+          I_RAT[ix] = mn(I_RAT[ix], S_valid[(r * K + k) * 2 + rf] ? S_reqk[(r * K + k) * 2 + rf] : BIG);
+        }
+    for (i64 lv = d.nlev - 1; lv >= 1; lv--) {
+      for (i64 i = ne_lo[lv]; i < ne_lo[lv + 1]; i++) {
+        i64 drv = d.ne_drv[i], snk = d.ne_snk[i];
+        for (i64 k = 0; k < K; k++)
+          for (int rf = 0; rf < 2; rf++) {
+            i64 ix = (drv * K + k) * 2 + rf;
+            I_RAT[ix] = mn(I_RAT[ix], I_RAT[(snk * K + k) * 2 + rf] - I_wd[snk * 2 + rf]);
+          }
+      }
+      for (i64 e = ce_lo[lv]; e < ce_lo[lv + 1]; e++) {
+        i64 to = d.ce_to[e], orf = d.ce_orf[e], fr = d.ce_from[e], irf = d.ce_irf[e];
+        for (i64 k = 0; k < K; k++) {
+          double v = I_RAT[(to * K + k) * 2 + orf] - I_gd[e];
+          i64 ix = (fr * K + k) * 2 + irf;
+          I_RAT[ix] = mn(I_RAT[ix], v);
+        }
+      }
+    }
+    for (i64 i = 0; i < nn; i++) I_nsl[i] = BIG;
+    for (i64 p = 0; p < P; p++) {
+      double m = BIG;
+      for (i64 k = 0; k < K; k++)
+        for (int rf = 0; rf < 2; rf++) {
+          i64 ix = (p * K + k) * 2 + rf;
+          bool ok = (I_AT[ix] > NEG / 2) && (I_RAT[ix] < BIG / 2);
+          m = mn(m, ok ? I_RAT[ix] - I_AT[ix] : BIG);
+        }
+      I_psl[p] = m;
+      i64 n = d.pin_net[p]; if (n < 0) n += nn;
+      I_nsl[n] = mn(I_nsl[n], m);
+    }
+  }
+  double tD = now();
+  lD.clear(); lDq.clear(); pDq.clear(); lI.clear(); lU.clear(); lUq.clear(); pUq.clear(); lP.clear();
+  I_full = true;
+  stats[0] = tB - tA; stats[1] = tC - tB; stats[2] = tD - tC; stats[3] = tD - tA;
+  return 0;
+}
+
+// ---------------------------------------------------------------- transactions
+extern "C" void csta_inc_begin() {
+  for (i64 i = (i64)pDq.size() - 1; i >= 0; i--) *pDq[i].p = pDq[i].v;
+  for (i64 i = (i64)pUq.size() - 1; i >= 0; i--) *pUq[i].p = pUq[i].v;
+  pDq.clear(); pUq.clear();
+  lD.clear(); lDq.clear(); lI.clear(); lU.clear(); lUq.clear(); lP.clear();
+}
+extern "C" void csta_inc_commit() { lD.clear(); lDq.clear(); lI.clear(); lU.clear(); lUq.clear(); lP.clear(); }
+extern "C" i64 csta_inc_reject() {
+  i64 n = (i64)(lD.size() + lI.size() + lU.size() + lP.size());
+  for (i64 i = (i64)lD.size() - 1; i >= 0; i--) *lD[i].p = lD[i].v;
+  for (i64 i = (i64)lI.size() - 1; i >= 0; i--) *lI[i].p = lI[i].v;
+  for (i64 i = (i64)lU.size() - 1; i >= 0; i--) *lU[i].p = lU[i].v;
+  for (i64 i = (i64)lP.size() - 1; i >= 0; i--) *lP[i].p = lP[i].v;
+  pDq.swap(lDq); pUq.swap(lUq);   // required-time rows of the rejected state stay visible until the next begin
+  lD.clear(); lDq.clear(); lI.clear(); lU.clear(); lUq.clear(); lP.clear();
+  return n;
+}
+extern "C" void csta_inc_flush_pending() {
+  for (i64 i = (i64)pDq.size() - 1; i >= 0; i--) *pDq[i].p = pDq[i].v;
+  for (i64 i = (i64)pUq.size() - 1; i >= 0; i--) *pUq[i].p = pUq[i].v;
+  pDq.clear(); pUq.clear();
+}
+
+// RC of nets copied from given arrays (test driver; logged)
+extern "C" int csta_inc_set_rc(const i64* nets, i64 k, const double* c1, const double* c2, const double* rpi, const double* ctot,
+                               const unsigned char* par, const double* elm) {
+  DA d = da();
+  for (i64 q = 0; q < k; q++) {
+    i64 n = nets[q];
+    for (int rf = 0; rf < 2; rf++) {
+      wD(&d.c1[n * 2 + rf], c1[n * 2 + rf]); wD(&d.c2[n * 2 + rf], c2[n * 2 + rf]); wD(&d.rpi[n * 2 + rf], rpi[n * 2 + rf]);
+      wD(&d.ctot[n * 2 + rf], ctot[n * 2 + rf]);
+    }
+    wU(&d.par[n], par[n]);
+    for (i64 t = apin_o[n]; t < apin_o[n + 1]; t++) { i64 p = apin[t]; wD(&d.elm[p * 2], elm[p * 2]); wD(&d.elm[p * 2 + 1], elm[p * 2 + 1]); }
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------- RC of one net (verbatim body of the csta_build_rc lambda)
+struct RCC { i64 P, nn, nlr, nvr; double UMGC; const i64 *ap_off, *ap_idx, *ap, *ap_pid, *net_drv; const double *pin_cap, *layer_rc, *via_r, *lumped;
+             const unsigned char* pin_is_drv; };
+// (only change: the per-net outputs c1/c2/rpi/ctot/par go to row oi of the caller's scratch instead of row n)
+static void rc_one(const RCC& C, i64 n, i64 oi, const i64* seg, const i64* sg, i64 m, double stub_um, double* c1o, double* c2o, double* rpio,
+                   double* ctoto, unsigned char* paro, double* elmo) {
+  const i64 *ap_off = C.ap_off, *ap_idx = C.ap_idx, *ap = C.ap, *ap_pid = C.ap_pid, *net_drv = C.net_drv;
+  const double *pin_cap = C.pin_cap, *layer_rc = C.layer_rc, *via_r = C.via_r;
+  const unsigned char* pin_is_drv = C.pin_is_drv;
+  const i64 nlr = C.nlr, nvr = C.nvr; const double UMGC = C.UMGC;
+  const int L = 16;
+  thread_local std::vector<i64> uk, ia, ib, adjo, adje, adjn, par, depth, order, stackn, stacki, bucket;
+  thread_local std::vector<double> Rs, Cs, ncap, cap, eR, Rp, y1, y2, y3, elm;
+  thread_local std::vector<PinRec> pins, pins2;
+  thread_local std::vector<unsigned char> reach;
+  uk.resize(2 * m);
+  for (i64 j = 0; j < m; j++) {
+    const i64* r = seg + sg[j] * 7;
+    uk[2 * j] = pack3(r[3], r[1], r[2]); uk[2 * j + 1] = pack3(r[6], r[4], r[5]);
+  }
+  std::sort(uk.begin(), uk.end());
+  uk.erase(std::unique(uk.begin(), uk.end()), uk.end());
+  const i64 NN = (i64)uk.size();
+  auto find = [&](i64 key) -> i64 { auto it = std::lower_bound(uk.begin(), uk.end(), key); return (it != uk.end() && *it == key) ? it - uk.begin() : -1; };
+  ia.resize(m); ib.resize(m); Rs.resize(m); Cs.resize(m);
+  ncap.assign(NN, 0.0);
+  for (i64 j = 0; j < m; j++) {
+    const i64* r = seg + sg[j] * 7;
+    i64 x1 = r[1], y1_ = r[2], z1 = r[3], x2 = r[4], y2_ = r[5], z2 = r[6];
+    ia[j] = find(pack3(z1, x1, y1_)); ib[j] = find(pack3(z2, x2, y2_));
+    bool isvia = z1 != z2;
+    double glen = (double)(std::llabs(x2 - x1) + std::llabs(y2_ - y1_)) * UMGC;
+    i64 zl = std::min(z1, z2);
+    i64 vi = std::min(std::max(zl, (i64)0), nvr - 1), li = std::min(std::max(z1, (i64)0), nlr - 1);
+    Rs[j] = isvia ? via_r[vi] : layer_rc[li * 2] * glen;
+    Cs[j] = isvia ? 0.0 : layer_rc[li * 2 + 1] * glen;
+  }
+  for (i64 j = 0; j < m; j++) ncap[ia[j]] += Cs[j] / 2;
+  for (i64 j = 0; j < m; j++) ncap[ib[j]] += Cs[j] / 2;
+  pins.clear();
+  for (i64 t = ap_off[n]; t < ap_off[n + 1]; t++) {
+    i64 a = ap_idx[t];
+    i64 apl = ap[a * 3], apx = ap[a * 3 + 1], apy = ap[a * 3 + 2];
+    i64 ku = find(pack3(std::min(apl + 1, (i64)L - 1), apx, apy));
+    i64 ks = (ku >= 0) ? -1 : find(pack3(apl, apx, apy));
+    bool oku = ku >= 0;
+    i64 gnode = oku ? ku : ks;
+    if (gnode < 0) continue;
+    PinRec pr;
+    pr.pin = ap_pid[a]; pr.gnode = gnode;
+    pr.grv = oku ? via_r[std::min(std::max(apl, (i64)0), nvr - 1)] : 0.0;
+    i64 lz = oku ? std::min(std::max(apl + 1, (i64)0), nlr - 1) : std::min(std::max(apl, (i64)0), nlr - 1);
+    pr.sr = layer_rc[lz * 2] * stub_um; pr.sc = layer_rc[lz * 2 + 1] * stub_um;
+    pins.push_back(pr);
+  }
+  std::stable_sort(pins.begin(), pins.end(), [](const PinRec& a, const PinRec& b) { return a.pin < b.pin; });
+  pins2.clear();
+  for (size_t t = 0; t < pins.size(); t++) if (t == 0 || pins[t].pin != pins[t - 1].pin) pins2.push_back(pins[t]);
+  const i64 npn = (i64)pins2.size(), NT = NN + npn;
+  cap.assign(NT * 2, 0.0);
+  for (i64 i = 0; i < NN; i++) { cap[i * 2] = ncap[i]; cap[i * 2 + 1] = ncap[i]; }
+  for (i64 k = 0; k < npn; k++) {
+    const PinRec& pr = pins2[k];
+    cap[(NN + k) * 2] = pin_cap[pr.pin * 2] + pr.sc / 2;
+    cap[(NN + k) * 2 + 1] = pin_cap[pr.pin * 2 + 1] + pr.sc / 2;
+  }
+  for (i64 k = 0; k < npn; k++) { cap[pins2[k].gnode * 2] += pins2[k].sc / 2; cap[pins2[k].gnode * 2 + 1] += pins2[k].sc / 2; }
+  const i64 E = m + npn;
+  eR.resize(E);
+  std::vector<i64>& eu = stackn; std::vector<i64>& ev = stacki;
+  eu.resize(E); ev.resize(E);
+  for (i64 j = 0; j < m; j++) { eu[j] = ia[j]; ev[j] = ib[j]; eR[j] = Rs[j]; }
+  for (i64 k = 0; k < npn; k++) { eu[m + k] = NN + k; ev[m + k] = pins2[k].gnode; eR[m + k] = pins2[k].grv + pins2[k].sr; }
+  adjo.assign(NT + 2, 0);
+  for (i64 e = 0; e < E; e++) { adjo[eu[e] + 1]++; adjo[ev[e] + 1]++; }
+  for (i64 i = 0; i < NT; i++) adjo[i + 1] += adjo[i];
+  adje.resize(2 * E); adjn.resize(2 * E);
+  bucket.assign(adjo.begin(), adjo.begin() + NT);
+  for (i64 e = 0; e < E; e++) {
+    i64 p = bucket[eu[e]]++; adje[p] = e; adjn[p] = ev[e];
+    p = bucket[ev[e]]++; adje[p] = e; adjn[p] = eu[e];
+  }
+  i64 drv = net_drv[n];
+  bool hasd = drv >= 0;
+  paro[oi] = hasd;
+  i64 root = -1;
+  if (hasd) { auto it = std::lower_bound(pins2.begin(), pins2.end(), drv, [](const PinRec& a, i64 v) { return a.pin < v; });
+    if (it != pins2.end() && it->pin == drv) root = NN + (it - pins2.begin()); }
+  if (root < 0) return;
+  par.assign(NT, -1); depth.assign(NT, 0); reach.assign(NT, 0);
+  std::vector<i64> stN, stI;
+  stN.push_back(root); stI.push_back(adjo[root]); reach[root] = 1;
+  order.clear(); order.push_back(root);
+  while (!stN.empty()) {
+    i64 u = stN.back(), i = stI.back();
+    if (i >= adjo[u + 1]) { stN.pop_back(); stI.pop_back(); continue; }
+    stI.back() = i + 1;
+    i64 w = adjn[i];
+    if (reach[w]) continue;
+    reach[w] = 1; par[w] = u; depth[w] = depth[u] + 1; order.push_back(w);
+    stN.push_back(w); stI.push_back(adjo[w]);
+  }
+  Rp.assign(NT, 0.0);
+  for (i64 w : order) {
+    if (par[w] < 0) continue;
+    double best = BIG * 1e300; bool f = false;
+    for (i64 i = adjo[w]; i < adjo[w + 1]; i++) if (adjn[i] == par[w]) { double r = eR[adje[i]]; if (!f || r < best) { best = r; f = true; } }
+    Rp[w] = best;
+  }
+  i64 maxd = 0; for (i64 w : order) maxd = std::max(maxd, depth[w]);
+  std::vector<i64> lstart(maxd + 2, 0);
+  for (i64 w : order) lstart[depth[w] + 1]++;
+  for (i64 dd = 0; dd <= maxd; dd++) lstart[dd + 1] += lstart[dd];
+  std::vector<i64> nodes_sorted(order.size());
+  std::sort(order.begin(), order.end());
+  { std::vector<i64> fp(lstart.begin(), lstart.end() - 1); for (i64 w : order) nodes_sorted[fp[depth[w]]++] = w; }
+  y1.assign(NT * 2, 0.0); y2.assign(NT * 2, 0.0); y3.assign(NT * 2, 0.0);
+  for (i64 w : order) { y1[w * 2] = cap[w * 2]; y1[w * 2 + 1] = cap[w * 2 + 1]; }
+  for (i64 dd = maxd; dd >= 1; dd--) {
+    for (i64 t = lstart[dd]; t < lstart[dd + 1]; t++) {
+      i64 w = nodes_sorted[t], p = par[w]; double R = Rp[w];
+      for (int rf = 0; rf < 2; rf++) {
+        double a1 = y1[w * 2 + rf], a2 = y2[w * 2 + rf], a3 = y3[w * 2 + rf];
+        y1[p * 2 + rf] += a1;
+        y2[p * 2 + rf] += a2 - R * a1 * a1;
+        y3[p * 2 + rf] += a3 - 2 * R * a1 * a2 + R * R * std::pow(a1, 3.0);
+      }
+    }
+  }
+  elm.assign(NT * 2, 0.0);
+  for (i64 dd = 1; dd <= maxd; dd++)
+    for (i64 t = lstart[dd]; t < lstart[dd + 1]; t++) {
+      i64 w = nodes_sorted[t], p = par[w];
+      for (int rf = 0; rf < 2; rf++) elm[w * 2 + rf] = elm[p * 2 + rf] + Rp[w] * y1[w * 2 + rf] * 1e-3;
+    }
+  for (int rf = 0; rf < 2; rf++) {
+    double Y1 = y1[root * 2 + rf], Y2 = y2[root * 2 + rf], Y3 = y3[root * 2 + rf];
+    bool capld = (Y2 == 0) && (Y3 == 0);
+    double c1 = capld ? Y1 : Y2 * Y2 / Y3;
+    double c2 = capld ? 0.0 : Y1 - Y2 * Y2 / Y3;
+    double rpi = capld ? 0.0 : -Y3 * Y3 / (Y2 * Y2 * Y2);
+    c1o[oi * 2 + rf] = nn0(c1); c2o[oi * 2 + rf] = nn0(c2); rpio[oi * 2 + rf] = nn0(rpi);
+    ctoto[oi * 2 + rf] = Y1;
+  }
+  for (i64 k = 0; k < npn; k++) {
+    i64 node = NN + k, pin = pins2[k].pin;
+    if (!reach[node]) continue;
+    if (pin_is_drv[pin]) continue;
+    elmo[pin * 2] = elm[node * 2]; elmo[pin * 2 + 1] = elm[node * 2 + 1];
+  }
+}
+
+// RC of the nets `nets` from the rows of `seg` that belong to them (other rows ignored), into the bound rc_* arrays.
+// stats: [0] prep (log+reset+bucket) [1] per-net work [2] total
+extern "C" int csta_inc_build_rc_subset(const i64* seg, i64 S, double stub_um, const i64* nets, i64 k, double* stats) {
+  double t0w = now();
+  DA d = da();
+  RCC C;
+  C.P = gi("P"); C.nn = gi("nn"); C.UMGC = *g<double>("um_per_gc");
+  C.ap_off = g<i64>("ap_off"); C.ap_idx = g<i64>("ap_idx"); C.ap = g<i64>("ap"); C.ap_pid = g<i64>("ap_pid"); C.net_drv = g<i64>("net_drv");
+  C.pin_cap = g<double>("pin_cap"); C.layer_rc = g<double>("layer_rc"); C.via_r = g<double>("via_r"); C.lumped = g<double>("lumped");
+  C.pin_is_drv = g<unsigned char>("pin_is_drv"); C.nlr = gi("nlr"); C.nvr = gi("nvr");
+  // log + reset to the defaults of csta_build_rc
+  std::vector<i64> nl; nl.reserve(k);
+  static std::vector<i64> pos; if ((i64)pos.size() != C.nn) pos.assign(C.nn, -1);
+  for (i64 q = 0; q < k; q++) {
+    i64 n = nets[q]; if (n < 0 || n >= C.nn || pos[n] >= 0) continue;
+    pos[n] = (i64)nl.size(); nl.push_back(n);
+    for (int rf = 0; rf < 2; rf++) {
+      wD(&d.c1[n * 2 + rf], 0.0); wD(&d.c2[n * 2 + rf], 0.0); wD(&d.rpi[n * 2 + rf], 0.0); wD(&d.ctot[n * 2 + rf], C.lumped[n * 2 + rf]);
+    }
+    wU(&d.par[n], 0);
+    // Elmore values are written below without logging (in parallel): log the old value unconditionally here
+    for (i64 t = apin_o[n]; t < apin_o[n + 1]; t++) { i64 p = apin[t];
+      lD.push_back({&d.elm[p * 2], d.elm[p * 2]}); lD.push_back({&d.elm[p * 2 + 1], d.elm[p * 2 + 1]}); d.elm[p * 2] = NaN; d.elm[p * 2 + 1] = NaN; }
+  }
+  // c1/c2/rpi/ctot/par: reset logged above (when it changed a value), final values logged against the reset value below
+  const i64 nk = (i64)nl.size();
+  std::vector<i64> cnt(nk + 1, 0);
+  std::vector<unsigned char> keep(S);
+  for (i64 s = 0; s < S; s++) {
+    const i64* r = seg + s * 7;
+    bool kp = r[0] >= 0 && r[0] < C.nn && pos[r[0]] >= 0 && ((r[3] != r[6]) || (r[1] != r[4]) || (r[2] != r[5]));
+    keep[s] = kp;
+    if (kp) cnt[pos[r[0]] + 1]++;
+  }
+  for (i64 i = 0; i < nk; i++) cnt[i + 1] += cnt[i];
+  std::vector<i64> sidx(cnt[nk]), fillp(cnt.begin(), cnt.end() - 1);
+  for (i64 s = 0; s < S; s++) if (keep[s]) sidx[fillp[pos[seg[s * 7]]]++] = s;
+  std::vector<i64> work;
+  for (i64 i = 0; i < nk; i++) if (cnt[i + 1] > cnt[i]) work.push_back(i);
+  std::sort(work.begin(), work.end(), [&](i64 a, i64 b) { return (cnt[a + 1] - cnt[a]) > (cnt[b + 1] - cnt[b]); });
+  // outputs go to scratch copies so that the writes can be logged serially afterwards
+  std::vector<double> c1s(nk * 2), c2s(nk * 2), rps(nk * 2), cts(nk * 2); std::vector<unsigned char> pas(nk);
+  for (i64 i = 0; i < nk; i++) { i64 n = nl[i]; for (int rf = 0; rf < 2; rf++) { c1s[i * 2 + rf] = 0.0; c2s[i * 2 + rf] = 0.0; rps[i * 2 + rf] = 0.0;
+    cts[i * 2 + rf] = C.lumped[n * 2 + rf]; } pas[i] = 0; }
+  double t1w = now();
+  pfor((i64)work.size(), 4, [&](i64 qlo, i64 qhi) {
+    for (i64 qi = qlo; qi < qhi; qi++) {
+      i64 i = work[qi], n = nl[i];
+      rc_one(C, n, i, seg, sidx.data() + cnt[i], cnt[i + 1] - cnt[i], stub_um, c1s.data(), c2s.data(), rps.data(), cts.data(), pas.data(), d.elm);
+    }
+  });
+  for (i64 i = 0; i < nk; i++) {
+    i64 n = nl[i];
+    for (int rf = 0; rf < 2; rf++) { wD(&d.c1[n * 2 + rf], c1s[i * 2 + rf]); wD(&d.c2[n * 2 + rf], c2s[i * 2 + rf]);
+      wD(&d.rpi[n * 2 + rf], rps[i * 2 + rf]); wD(&d.ctot[n * 2 + rf], cts[i * 2 + rf]); }
+    wU(&d.par[n], pas[i]);
+    pos[n] = -1;
+  }
+  double t2w = now();
+  stats[0] = t1w - t0w; stats[1] = t2w - t1w; stats[2] = t2w - t0w;
+  return (int)nk;
+}
+
+// ---------------------------------------------------------------- the update
+// dirty levels of a gate group: 1 = only an input ARRIVAL changed (arc delays, slews and driver records are unchanged: the
+// arrival is re-derived from the stored delays, no Newton solve), 2 = the input slew of some arcs changed (those arcs are
+// re-solved, aflag), 3 = RC of the output net changed (all arcs re-solved). Net edges: 1 = arrival only, 2 = full.
+static inline void markG(i64 gg, unsigned char lvl) {
+  if (!gflag[gg]) { if (2 * I_glv[gg] <= cur_phase) late_marks++; Gd[I_glv[gg]].push_back(gg); }
+  if (gflag[gg] < lvl) gflag[gg] = lvl;
+}
+static inline void markE(i64 i, i64 rf, unsigned char lvl) {
+  i64 key = i * 2 + rf;
+  if (!eflag[key]) { if (2 * I_elv[i] + 1 <= cur_phase) late_marks++; Ed[I_elv[i]].push_back(key); }
+  if (eflag[key] < lvl) eflag[key] = lvl;
+}
+static inline void markR(i64 r) { if (!rflag[r]) { rflag[r] = 1; rlist.push_back(r); } }
+static inline void propagate(i64 q, i64 rf, bool slew, bool drec) {   // (pin, rf) changed: slew / driver record / arrival
+  if (slew) { for (i64 t = rda_o[q * 2 + rf]; t < rda_o[q * 2 + rf + 1]; t++) { i64 e = rda[t]; aflag[e] = 1; markG(I_agrp[e], 2); } }
+  else for (i64 t = rdg_o[q * 2 + rf]; t < rdg_o[q * 2 + rf + 1]; t++) markG(rdg[t], 1);
+  for (i64 t = drve_o[q]; t < drve_o[q + 1]; t++) markE(drve[t], rf, (slew || drec) ? 2 : 1);
+  for (i64 t = prow_o[q]; t < prow_o[q + 1]; t++) markR(prow[t]);
+}
+// arrival / BEST of a group from the STORED arc delays (== group_compute when no input slew and no RC changed)
+static void group_at_only(const DA& d, i64 gg, double* at_o, i64* best_o) {
+  const i64 s0 = d.g_start[gg], s1 = I_gs1[gg], K = d.K;
+  for (i64 k = 0; k < K; k++) {
+    double amax = NEG; bool first = true;
+    for (i64 e = s0; e < s1; e++) {
+      double c = I_AT[(d.ce_from[e] * K + k) * 2 + d.ce_irf[e]] + I_gd[e];
+      amax = first ? c : mx(amax, c); first = false;
+    }
+    at_o[k] = amax;
+    i64 best = d.nE;
+    for (i64 e = s0; e < s1; e++) {
+      double c = I_AT[(d.ce_from[e] * K + k) * 2 + d.ce_irf[e]] + I_gd[e];
+      if (c >= amax - 1e-12) { best = e; break; }
+    }
+    best_o[k] = best;
+  }
+}
+
+// counters: [0] seed nets [1] groups recomputed in full [2] arcs recomputed [3] net edges (x rf) recomputed in full
+//           [4] group outputs changed [5] sinks changed [6] rows recomputed [7] endpoint pins [8] nets net_rd recomputed
+//           [9] late marks [10] levels touched [11] groups arrival-only [12] net edges arrival-only [13] group outputs whose
+//           slew changed [14] sinks whose slew changed [15] picked arcs re-solved only to rebuild the driver record
+// stats: [0] forward [1] endpoints [2] total
+extern "C" i64 csta_inc_update(const i64* nets, i64 nnet, i64* cnt, double* stats) {
+  for (int i = 0; i < 16; i++) cnt[i] = 0;
+  if (!I_ready || !I_full) return -1;
+  double tA = now();
+  DA d = da();
+  const i64 K = d.K;
+  late_marks = 0; cur_phase = 0;
+  nlist.clear();
+  for (i64 q = 0; q < nnet; q++) {
+    i64 n = nets[q]; if (n < 0 || n >= d.nn || nflag[n]) continue;
+    nflag[n] = 1; nlist.push_back(n);
+    for (i64 t = netg_o[n]; t < netg_o[n + 1]; t++) markG(netg[t], 3);
+    for (i64 t = nete_o[n]; t < nete_o[n + 1]; t++) { markE(nete[t], 0, 2); markE(nete[t], 1, 2); }
+  }
+  for (i64 n : nlist) nflag[n] = 0;
+  cnt[0] = (i64)nlist.size();
+  static std::vector<Dmp> res; static std::vector<i64> roff; static std::vector<GOut> go; static std::vector<double> at; static std::vector<i64> bs;
+  static std::vector<double> ewd, els; static std::vector<i64> GF, GA, EF, EA;
+  rdlist.clear();
+  for (i64 lv = 1; lv < d.nlev; lv++) {
+    std::vector<i64>& GL = Gd[lv];
+    if (!GL.empty()) {
+      cnt[10]++;
+      cur_phase = 2 * lv;
+      std::sort(GL.begin(), GL.end());
+      GF.clear(); GA.clear();
+      for (i64 gg : GL) (gflag[gg] >= 2 ? GF : GA).push_back(gg);
+      const i64 m = (i64)GF.size(), ma = (i64)GA.size();
+      roff.resize(m + 1); roff[0] = 0;
+      for (i64 j = 0; j < m; j++) roff[j + 1] = roff[j] + (I_gs1[GF[j]] - d.g_start[GF[j]]);
+      res.resize(roff[m]); go.resize(m); at.resize((m + ma) * K); bs.resize((m + ma) * K);
+      pfor(m, 16, [&](i64 lo_, i64 hi_) { for (i64 j = lo_; j < hi_; j++) group_compute(d, GF[j], gflag[GF[j]] == 3, res.data() + roff[j], at.data() + j * K, bs.data() + j * K, go[j]); });
+      pfor(ma, 256, [&](i64 lo_, i64 hi_) { for (i64 j = lo_; j < hi_; j++) group_at_only(d, GA[j], at.data() + (m + j) * K, bs.data() + (m + j) * K); });
+      cnt[1] += m; cnt[11] += ma;
+      for (i64 j = 0; j < m; j++) {
+        i64 gg = GF[j], s0 = d.g_start[gg], s1 = I_gs1[gg], gto = d.g_to[gg], gorf = d.g_orf[gg];
+        for (i64 e = s0; e < s1; e++) {
+          const Dmp& r = res[roff[j] + e - s0];
+          if (r.alg != STORED) { cnt[2]++; wD(&I_gd[e], r.delay); wD(&I_as[e], r.slew); }
+          aflag[e] = 0;
+        }
+        cnt[15] += go[j].pick_recomputed;
+        bool chs = wD(&I_SL[gto * 2 + gorf], go[j].sl);
+        bool chd = wP(&I_dps[gto * 2 + gorf], go[j].dp);
+        bool cha = false;
+        for (i64 k = 0; k < K; k++) { cha |= wD(&I_AT[(gto * K + k) * 2 + gorf], at[j * K + k]); wI(&I_BEST[(gto * K + k) * 2 + gorf], bs[j * K + k]); }
+        bool rch = wU(&I_gpk[gg], go[j].pk); rch |= wD(&I_grd[gg], go[j].rd); rch |= wI(&I_gpke[gg], go[j].pke);
+        if (rch) { i64 n = d.pin_net[gto]; if (!rdflag[n]) { rdflag[n] = 1; rdlist.push_back(n); } }
+        if (chs || chd || cha) { cnt[4]++; cnt[13] += chs; propagate(gto, gorf, chs, chd); }
+        gflag[gg] = 0;
+      }
+      for (i64 j = 0; j < ma; j++) {
+        i64 gg = GA[j], gto = d.g_to[gg], gorf = d.g_orf[gg];
+        bool cha = false;
+        for (i64 k = 0; k < K; k++) { cha |= wD(&I_AT[(gto * K + k) * 2 + gorf], at[(m + j) * K + k]); wI(&I_BEST[(gto * K + k) * 2 + gorf], bs[(m + j) * K + k]); }
+        if (cha) { cnt[4]++; propagate(gto, gorf, false, false); }
+        gflag[gg] = 0;
+      }
+      GL.clear();
+    }
+    std::vector<i64>& EL = Ed[lv];
+    if (!EL.empty()) {
+      cur_phase = 2 * lv + 1;
+      std::sort(EL.begin(), EL.end());
+      EF.clear(); EA.clear();
+      for (i64 key : EL) (eflag[key] == 2 ? EF : EA).push_back(key);
+      const i64 m = (i64)EF.size(), ma = (i64)EA.size();
+      ewd.resize(m); els.resize(m); at.resize((m + ma) * K);
+      pfor(m, 64, [&](i64 lo_, i64 hi_) { for (i64 j = lo_; j < hi_; j++) edge_compute(d, EF[j] / 2, EF[j] % 2, &ewd[j], &els[j], at.data() + j * K); });
+      pfor(ma, 1024, [&](i64 lo_, i64 hi_) { for (i64 j = lo_; j < hi_; j++) {
+        i64 i = EA[j] / 2, rf = EA[j] % 2, drv = d.ne_drv[i], snk = d.ne_snk[i]; double wd = I_wd[snk * 2 + rf];
+        for (i64 k = 0; k < K; k++) at[(m + j) * K + k] = I_AT[(drv * K + k) * 2 + rf] + wd; } });
+      cnt[3] += m; cnt[12] += ma;
+      for (i64 j = 0; j < m; j++) {
+        i64 i = EF[j] / 2, rf = EF[j] % 2, snk = d.ne_snk[i];
+        wD(&I_wd[snk * 2 + rf], ewd[j]);
+        bool chs = wD(&I_SL[snk * 2 + rf], els[j]), cha = false;
+        for (i64 k = 0; k < K; k++) cha |= wD(&I_AT[(snk * K + k) * 2 + rf], at[j * K + k]);
+        if (chs || cha) { cnt[5]++; cnt[14] += chs; propagate(snk, rf, chs, false); }
+        eflag[EF[j]] = 0;
+      }
+      for (i64 j = 0; j < ma; j++) {
+        i64 i = EA[j] / 2, rf = EA[j] % 2, snk = d.ne_snk[i];
+        bool cha = false;
+        for (i64 k = 0; k < K; k++) cha |= wD(&I_AT[(snk * K + k) * 2 + rf], at[(m + j) * K + k]);
+        if (cha) { cnt[5]++; propagate(snk, rf, false, false); }
+        eflag[EA[j]] = 0;
+      }
+      EL.clear();
+    }
+  }
+  // net_rd of the nets whose groups changed their pick (same order as the full pass: groups in index order)
+  for (i64 n : rdlist) {
+    double v = 0.0;
+    for (i64 t = netg_o[n]; t < netg_o[n + 1]; t++) { i64 gg = netg[t]; if (I_gpk[gg]) v = mx(v, I_grd[gg]); }
+    wD(&I_nrd[n], v); rdflag[n] = 0;
+  }
+  cnt[8] = (i64)rdlist.size();
+  double tB = now();
+  // endpoint rows
+  std::sort(rlist.begin(), rlist.end());
+  const i64 nr = (i64)rlist.size();
+  static std::vector<double> rq, rm; static std::vector<unsigned char> rv;
+  rq.resize(nr * K * 2); rv.resize(nr * K * 2); rm.resize(nr);
+  pfor(nr, 256, [&](i64 lo_, i64 hi_) { for (i64 j = lo_; j < hi_; j++) rm[j] = row_compute(d, rlist[j], rq.data() + j * K * 2, rv.data() + j * K * 2); });
+  plist.clear();
+  for (i64 j = 0; j < nr; j++) {
+    i64 r = rlist[j];
+    for (i64 q = 0; q < K * 2; q++) {
+      double* pq = &S_reqk[r * K * 2 + q]; if (!beq(*pq, rq[j * K * 2 + q])) { lDq.push_back({pq, *pq}); *pq = rq[j * K * 2 + q]; }
+      unsigned char* pv = &S_valid[r * K * 2 + q]; if (*pv != rv[j * K * 2 + q]) { lUq.push_back({pv, *pv}); *pv = rv[j * K * 2 + q]; }
+    }
+    wD(&I_rmin[r], rm[j]);
+    i64 p = d.ck_pin[r]; if (!pflag[p]) { pflag[p] = 1; plist.push_back(p); }
+    rflag[r] = 0;
+  }
+  rlist.clear();
+  for (i64 p : plist) {
+    double v = BIG;
+    for (i64 t = prow_o[p]; t < prow_o[p + 1]; t++) v = mn(v, I_rmin[prow[t]]);
+    wD(&I_ep[p], v); pflag[p] = 0;
+  }
+  cnt[6] = nr; cnt[7] = (i64)plist.size(); cnt[9] = late_marks;
+  double tC = now();
+  stats[0] = tB - tA; stats[1] = tC - tB; stats[2] = tC - tA;
+  return late_marks ? -2 : 0;
+}
+
+// ---------------------------------------------------------------- access
+extern "C" void* csta_inc_ptr(const char* name) {
+  std::string s(name);
+  if (s == "AT") return I_AT.data(); if (s == "SL") return I_SL.data(); if (s == "gate_d") return I_gd.data();
+  if (s == "wire_d") return I_wd.data(); if (s == "arc_slew") return I_as.data(); if (s == "BEST") return I_BEST.data(); if (s == "net_rd") return I_nrd.data();
+  if (s == "rmin") return I_rmin.data(); if (s == "ep_sl") return I_ep.data(); if (s == "grp_rd") return I_grd.data();
+  if (s == "grp_pk") return I_gpk.data(); if (s == "grp_pke") return I_gpke.data(); if (s == "RAT") return I_RAT.data();
+  if (s == "pin_slack") return I_psl.data(); if (s == "net_slack") return I_nsl.data();
+  if (s == "reqk") return S_reqk.data(); if (s == "valid") return S_valid.data();
+  return nullptr;
+}
+extern "C" i64 csta_inc_ngroups() { return I_g1; }
+// driver-model records -> out[P*2][16] doubles + ai[P*2][2] (alg, valid)
+extern "C" void csta_inc_dps(double* out, i64* ai) {
+  for (size_t i = 0; i < I_dps.size(); i++) {
+    const DP& q = I_dps[i];
+    double v[16] = {q.slew, q.t0, q.dt, q.k0, q.k1, q.k2, q.k3, q.k4, q.p1, q.p2, q.vub, q.vod, q.vth, q.vl, q.vh, q.der};
+    memcpy(out + i * 16, v, sizeof v); ai[i * 2] = q.alg; ai[i * 2 + 1] = q.valid;
+  }
+}
+extern "C" i64 csta_inc_logsize() { return (i64)(lD.size() + lDq.size() + lI.size() + lU.size() + lUq.size() + lP.size()); }

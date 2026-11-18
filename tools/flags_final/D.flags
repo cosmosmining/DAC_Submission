@@ -1,0 +1,1 @@
+--lam 0 --gate 0 --ovf_max_runs 200 --dgr 8 --dgr_lrk 20 --dgr_t1 0.2 --dgr_dl 0.03 --dgr_dat 0.0001 --dgr_nets 8000 --dgr_at fp --dgr_skip_fp 3 --dgr_rounds 3 --dgr_defer 1

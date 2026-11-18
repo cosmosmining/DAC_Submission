@@ -1,0 +1,1 @@
+--par7 1 --timer5 1 --n_ofc 1 --n_sel 1 --n_norm 1 --n_pre 1 --n_b2 1 --n_seg 1 --n_rr 4 --ovf_max_runs 3000 --n_rs 5 --n_rs_batch 16 --n_rs_stop 0.01 --ovfround_skip 0.18 --n_rs_big_exact 1

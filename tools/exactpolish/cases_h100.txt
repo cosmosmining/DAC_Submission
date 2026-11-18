@@ -1,0 +1,30 @@
+# cases_h100.txt: per-case settings of the final flow, one row per design (columns below), then the env lines that apply to every arm.
+# Rows are taken from the records of the final flow; the route fingerprint column is not kept in this snapshot (shown as -).
+# Env lines: "env final NAME=VALUE" sets, "env final -NAME" unsets (see below).
+# Row columns: suite design mode dls env md5_frozen extra-chain-flags
+#   mode        small = run_n1.sh arm n1y (chain_y) with DLS=<dls>; big = arm n1 (chain_d1) with D1X="$MEM $DF --deadline_s <dls>"
+#               (run_n1.sh then prints an empty dls field, as the record does)
+#   env         an env set below, applied to every arm of the case (XPB, XPI, XPP): "NAME=VALUE" (value to the end of the line) is set,
+#               "-NAME" is unset ("-PREFIX_*" unsets every exported name that matches) before the launch
+#   md5_frozen  not kept in this snapshot: always -
+# The arms add only: XPB unsets SCHED_DIR; XPI sets XP_ON=0 XP_OUT SCHED_DIR=shim; XPP sets XPENV XP_OUT SCHED_DIR=shim (every other XP_*
+# of the caller is unset in all arms). The launcher that reads these arms is not included.
+# No "@" anywhere outside comments: a slot left open stops the launcher.
+env final BIG8_SDFREE=0
+env final FCX=dem,rcsub,b2par,ecopy,names
+env final FC_THP=1
+env final SCHED_H100=1
+env final SCHED_X=--sched_model off --sched_stop_frac 0.02 --sched_a4 1 --skip_ovf_rule 1 --sched_extra_dgr 4
+env final -GG_* -NS_* -PP_* -PP2_* -PP2Y_* -E2_* -X1_* -CB_*
+env final -DG_LIB_GPU -DG_UM_HEADROOM_GB -RT -PW_SCALE -DGR_CPU -DGR_SWEEP -DGR_SWEEP_OUT -OVF3_SWEEP -MID5_STOP -N1_DRYRUN -SCHED_ROOT
+env final -L5_CHECK -L5_PF -L5_RS -L5_SEL -MID5_CHECK -OVF3_DEBUG -T_FWD_NP -T_FWD_TEST -W3_MD5 -W3_VALID -N_B2_CHECK -N_SEG_CHECK -FIXCUT_CHECK
+visible ariane               small 99999 final - --dgr 20 --dgr_nets 16000 --dgr_rounds 5
+blind   ariane               small 99999 final - --dgr 20 --dgr_nets 16000 --dgr_rounds 5
+visible bsg_chip             small 99999 final - --dgr 20 --dgr_nets 16000 --dgr_rounds 5
+blind   bsg_chip             small 99999 final - --dgr 20 --dgr_nets 16000 --dgr_rounds 5
+visible NV_NVDLA_partition_c small 99999 final - --dgr 20 --dgr_nets 16000 --dgr_rounds 5
+blind   NV_NVDLA_partition_c small 99999 final - --dgr 20 --dgr_nets 16000 --dgr_rounds 5
+visible mempool_tile_wrap    small 99999 final - --dgr 20 --dgr_nets 16000 --dgr_rounds 5
+blind   mempool_tile_wrap    small 99999 final - --dgr 20 --dgr_nets 16000 --dgr_rounds 5
+visible mempool_group        big   99999 final - --dgr 20 --dgr_nets 16000 --dgr_rounds 5
+blind   mempool_group        big   99999 final - --dgr 20 --dgr_nets 16000 --dgr_rounds 5
